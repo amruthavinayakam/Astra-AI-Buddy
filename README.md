@@ -1,6 +1,6 @@
-<<<<<<< HEAD
+
 # Astra-AI-Buddy
-=======
+
 # Astra – Gamified AI Buddy
 
 A full-stack app where Astra monitors habits, plans quests with Gemini, updates XP/levels, and chats via Firebase.
@@ -36,4 +36,4 @@ npm run dev
 - Subscribe client to topic `/topics/{uid}` for FCM if using.
 - Optional: add Redis for long-term memory.
 
->>>>>>> a1cd727 (feat: scaffold Astra app, Firebase, agent function)
+
