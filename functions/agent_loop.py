@@ -22,6 +22,13 @@ db = firestore.client()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
 _model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+_dev_mode = os.getenv("ASTRA_DEV", "0") == "1"
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
 
 def _now_utc() -> dt.datetime:
@@ -47,20 +54,28 @@ def _build_prompt(xp: int, streak: int, last_active: str) -> str:
 
 
 def _call_gemini(prompt: str) -> Dict[str, Any]:
-    model = genai.GenerativeModel(_model_name)
-    res = model.generate_content(prompt)
-    text = (res.text or "").strip()
-    # Best-effort parse; if not valid JSON, fallback
-    import json
     try:
-        data = json.loads(text)
-        return {
-            "quest": data.get("quest", "Do one small productive action."),
-            "message": data.get("message", "You've got this!"),
-            "mood": data.get("mood", "neutral"),
-        }
+        if not os.getenv("GEMINI_API_KEY"):
+            raise RuntimeError("Missing GEMINI_API_KEY")
+        model = genai.GenerativeModel(_model_name)
+        res = model.generate_content(prompt)
+        text = (getattr(res, "text", "") or "").strip()
+        # Best-effort parse; if not valid JSON, fallback
+        import json
+        try:
+            data = json.loads(text)
+            return {
+                "quest": data.get("quest", "Do one small productive action."),
+                "message": data.get("message", "You've got this!"),
+                "mood": data.get("mood", "neutral"),
+            }
+        except Exception:
+            return {
+                "quest": "Do one small productive action.",
+                "message": "You've got this!",
+                "mood": "neutral",
+            }
     except Exception:
-        # Fallback simple parse by lines
         return {
             "quest": "Do one small productive action.",
             "message": "You've got this!",
@@ -109,58 +124,67 @@ def _notify(user_id: str, title: str, body: str) -> None:
 
 @functions_framework.http
 def agent_loop(request):
-    # Authenticating Scheduler can add a header/token validation here
-    users = db.collection("users").stream()
-    now = _now_utc().isoformat()
+    if request.method == "OPTIONS":
+        return ("", 204, CORS_HEADERS)
+    # Lightweight dev short-circuit (no Firestore/Gemini)
+    if _dev_mode:
+        return ("ok", 200, CORS_HEADERS)
+    try:
+        # Authenticating Scheduler can add a header/token validation here
+        users = db.collection("users").stream()
+        now = _now_utc().isoformat()
 
-    for user in users:
-        uid = user.id
-        u = user.to_dict() or {}
-        xp = int(u.get("xp", 0))
-        streak = int(u.get("streak", 0))
-        last_active = u.get("lastActive") or now
+        for user in users:
+            uid = user.id
+            u = user.to_dict() or {}
+            xp = int(u.get("xp", 0))
+            streak = int(u.get("streak", 0))
+            last_active = u.get("lastActive") or now
 
-        habits = _get_user_habits(uid)
-        tasks_done = _count_done_today(habits)
-        missed = 0  # optionally compute by comparing schedule
+            habits = _get_user_habits(uid)
+            tasks_done = _count_done_today(habits)
+            missed = 0  # optionally compute by comparing schedule
 
-        plan = _call_gemini(_build_prompt(xp, streak, str(last_active)))
+            plan = _call_gemini(_build_prompt(xp, streak, str(last_active)))
 
-        # Update XP/level
-        xp_res = _apply_xp_rules(xp, tasks_done, missed)
-        mood = plan.get("mood", "neutral")
+            # Update XP/level
+            xp_res = _apply_xp_rules(xp, tasks_done, missed)
+            mood = plan.get("mood", "neutral")
 
-        user_ref = db.collection("users").document(uid)
-        user_ref.set({
-            "xp": xp_res["xp"],
-            "level": xp_res["level"],
-            "mood": mood,
-            "lastActive": firestore.SERVER_TIMESTAMP,
-        }, merge=True)
+            user_ref = db.collection("users").document(uid)
+            user_ref.set({
+                "xp": xp_res["xp"],
+                "level": xp_res["level"],
+                "mood": mood,
+                "lastActive": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
 
-        # Write quest
-        db.collection("quests").add({
-            "userId": uid,
-            "text": plan.get("quest"),
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "status": "new",
-        })
+            # Write quest
+            db.collection("quests").add({
+                "userId": uid,
+                "text": plan.get("quest"),
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "status": "new",
+            })
 
-        # Write message from Astra
-        msg_text = plan.get("message", "You've got this!")
-        db.collection("messages").add({
-            "userId": uid,
-            "sender": "astra",
-            "text": msg_text,
-            "timestamp": firestore.SERVER_TIMESTAMP,
-        })
+            # Write message from Astra
+            msg_text = plan.get("message", "You've got this!")
+            db.collection("messages").add({
+                "userId": uid,
+                "sender": "astra",
+                "text": msg_text,
+                "timestamp": firestore.SERVER_TIMESTAMP,
+            })
 
-        _append_memory(uid, "system", f"Quest: {plan.get('quest')}")
-        _append_memory(uid, "assistant", msg_text)
-        _update_long_memory(uid, xp_res["xp"], streak, mood)
+            _append_memory(uid, "system", f"Quest: {plan.get('quest')}")
+            _append_memory(uid, "assistant", msg_text)
+            _update_long_memory(uid, xp_res["xp"], streak, mood)
 
-        _notify(uid, "Astra has a new quest!", msg_text)
+            _notify(uid, "Astra has a new quest!", msg_text)
 
-    return ("ok", 200)
+        return ("ok", 200, CORS_HEADERS)
+    except Exception:
+        # Ensure CORS on error
+        return ("error", 500, CORS_HEADERS)
 
 
